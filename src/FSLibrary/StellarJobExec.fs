@@ -11,9 +11,11 @@ open StellarCoreSet
 open StellarDataDump
 open StellarFormation
 open StellarKubeSpecs
+open StellarRemoteCommandExec
 open System
 open System.Threading
 open Microsoft.Rest
+open StellarShellCmd
 
 type JobStatusTable() =
     let mutable running = Set.empty
@@ -108,8 +110,9 @@ type StellarFormation with
     member self.RunSingleJob (job: (string array)) (image: string) (useConfigFile: bool) : Map<string, bool> =
         self.RunSingleJobWithTimeout None job image useConfigFile
 
-    member self.RunSingleJobWithTimeout
+    member self.RunSingleJobWithTimeoutOrMonitor
         (timeout: TimeSpan option)
+        (monitor: ShCmd option)
         (cmd: (string array))
         (image: string)
         (useConfigFile: bool)
@@ -120,6 +123,8 @@ type StellarFormation with
         let name = j.Metadata.Name
         let ns = j.Metadata.NamespaceProperty
         jst.NoteRunning j.Metadata.Name
+
+        let mutable monitor = monitor
 
         while not (jst.IsFinished(name)) do
             if timeout.IsSome && (DateTime.UtcNow - startTime) > timeout.Value then
@@ -133,12 +138,33 @@ type StellarFormation with
             self.sleepUntilNextRateLimitedApiCallTime ()
 
             let js = self.Kube.ReadNamespacedJob(name = name, namespaceParameter = ns)
-            self.CheckJob js jst
-            Thread.Sleep(30000)
+            let pod = (self.GetJobPods js).Items.[0]
+
+            match monitor with
+            | Some monitorcmd ->
+                if pod.Status.Phase = "Running" then
+                    let pods = self.GetJobPods j
+                    let podname = pods.Items.Item(0).Metadata.Name
+                    self.RunRemoteCommand((PodName podname), cmd, monitorcmd)
+                    monitor <- None
+                else
+                    self.CheckJob js jst
+                    Thread.Sleep(1000)
+            | _ ->
+                self.CheckJob js jst
+                Thread.Sleep(30000)
 
         let endTime = DateTime.UtcNow
         LogInfo "Job finished after %O: '%s'" (endTime - startTime) (String.Join(" ", cmd))
         jst.GetFinishedTable()
+
+    member self.RunSingleJobWithTimeout
+        (timeout: TimeSpan option)
+        (cmd: (string array))
+        (image: string)
+        (useConfigFile: bool)
+        : Map<string, bool> =
+        self.RunSingleJobWithTimeoutOrMonitor timeout None cmd image useConfigFile
 
     member self.RunParallelJobsInRandomOrder
         (parallelism: int)

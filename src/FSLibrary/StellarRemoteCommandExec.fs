@@ -6,6 +6,7 @@ module StellarRemoteCommandExec
 
 open Logging
 open StellarCoreSet
+open StellarCoreCfg
 open StellarFormation
 open StellarShellCmd
 open CSLibrary
@@ -23,10 +24,17 @@ type StellarFormation with
     // on k8s side (+-based), so any commands with spaces (eg. all the composite ones) will
     // fail. Stdin (over websockets!)is a little more robust.
 
-    member self.RunRemoteCommand(peer: PodName, cmd: ShCmd) : unit =
+    member self.RunRemoteCommand(pod: PodName, containercmd: string array, cmd: ShCmd) : unit =
         let cmdStr = cmd.ToString()
         let truncated = if cmdStr.Length > 20 then cmdStr.Substring(0, 20) + "..." else cmdStr
-        LogInfo "Running %d-byte shell command on peer %s: %s" cmdStr.Length peer.StringName truncated
+        let container = CfgVal.stellarCoreContainerName containercmd.[0]
+
+        LogInfo
+            "Running %d-byte shell command on pod %s container %s:  %s"
+            cmdStr.Length
+            pod.StringName
+            container
+            truncated
 
         // We're feeding /bin/sh a command on stdin, which means we also need to run an exit
         // command at the end to ensure it actually terminates instead of sitting there.
@@ -40,14 +48,22 @@ type StellarFormation with
         self.sleepUntilNextRateLimitedApiCallTime ()
 
         let res =
-            RemoteCommandRunner.RunRemoteCommand(
-                kube = self.Kube,
-                ns = self.NetworkCfg.NamespaceProperty,
-                podName = peer.StringName,
-                containerName = "stellar-core-run",
-                shellCmdStrIncludingNewLine = fullCmdStr
-            )
+            try
+                RemoteCommandRunner.RunRemoteCommand(
+                    kube = self.Kube,
+                    ns = self.NetworkCfg.NamespaceProperty,
+                    podName = pod.StringName,
+                    containerName = container,
+                    shellCmdStrIncludingNewLine = fullCmdStr
+                )
+            with
+            | :? System.Net.WebSockets.WebSocketException as w ->
+                LogError "RemoteCommandRunner Failed: %s" (w.ToString())
+                reraise ()
+            | :? System.AggregateException as a ->
+                LogError "RemoteCommandRunner Failed: %s" (a.ToString())
+                reraise ()
 
         if res <> 0 then
-            (LogError "Command failed on peer %s: %s => exited %d " peer.StringName truncated res
+            (LogError "Command failed on peer %s: %s => exited %d " pod.StringName truncated res
              failwith "remote command execution failed")
